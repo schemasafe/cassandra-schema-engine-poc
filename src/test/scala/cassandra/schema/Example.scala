@@ -1,5 +1,6 @@
 package cassandra.schema
 
+import SchemaValidation._
 object Example extends App {
 
   val queries = Seq(
@@ -7,5 +8,7 @@ object Example extends App {
     "create table test.zz (y int primary key)")
 
   val result = SchemaValidation.createSchema(queries)
+
   println(s"* result: $result")
+  println("select * from test.zz".validateQuery)
 }
