@@ -4,11 +4,12 @@ import SchemaValidation._
 object Example extends App {
 
   val queries = Seq(
-    "create keyspace test WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' :  1};",
-    "create table test.zz (y int primary key)")
+    "create keyspace if not exists test WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' :  1};",
+    "create table test.posts(id int primary key)")
 
   val result = SchemaValidation.createSchema(queries)
+  val select = SchemaValidation.checkSchema("select * from test.posts")
 
-  println(s"* result: $result")
-  println("select * from test.zz".validateQuery)
+  println(s"* create schema: $result")
+  println(s"* check schema: $select")
 }

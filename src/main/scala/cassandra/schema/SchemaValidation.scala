@@ -1,31 +1,37 @@
 package cassandra.schema
 
-import scala.collection.JavaConverters._
-
 import java.lang.management.ManagementFactory
 import java.util.Collections
 import javax.management.MBeanServer
 
-import org.apache.cassandra.config.Config
-import org.apache.cassandra.cql3.statements.CreateKeyspaceStatement
+import org.apache.cassandra.config.{Config, Schema}
+import org.apache.cassandra.cql3.statements.{CFStatement, CreateKeyspaceStatement, CreateTableStatement}
 import org.apache.cassandra.cql3.{QueryOptions, QueryProcessor}
 import org.apache.cassandra.exceptions.RequestValidationException
+import org.apache.cassandra.schema._
 import org.apache.cassandra.service.{ClientState, QueryState}
+
+import scala.collection.JavaConverters._
 
 object SchemaValidation {
   Config.setClientMode(true)
+
   val state = ClientState.forInternalCalls()
   val queryState = new QueryState(state)
 
   implicit class ValidateQuery(query: String) {
-    def validateQuery: Either[String, String] = {
+    def validateSyntax: Either[String, String] = {
       try {
-        QueryProcessor.parseStatement(query, queryState)
+        QueryProcessor.parseStatement(query)
         Right(query)
       } catch {
         case e: RequestValidationException => Left(e.getMessage)
       }
     }
+  }
+
+  def checkSchema(query: String): Either[String, String] = {
+    query.validateSyntax //FIXME: validate statement
   }
 
   def createSchema(queries: Seq[String]): Either[String, String] = {
@@ -38,46 +44,42 @@ object SchemaValidation {
         _.getObjectName.getCanonicalName.contains("org.apache.cassandra"))
       .foreach(i => mbs.unregisterMBean(i.getObjectName))
 
-    val createKsQuery = queries.head
-    val createTableQuery = queries.last
-    createKsQuery.validateQuery.fold(
-      error => Left(error),
-      ksQuery => {
-        val createKsStatement = QueryProcessor
-          .parseStatement(ksQuery)
-          .asInstanceOf[CreateKeyspaceStatement]
-        val ksName = createKsStatement.keyspace()
+    val options = QueryOptions.forInternalCalls(Collections.emptyList())
 
-        //create keyspace
-        schemaChange(ksQuery, ksName)
-        createTableQuery.validateQuery.fold(
-          error => Left(error),
-          tableQuery => {
-            //create table
-//            val createTable = QueryProcessor
-//              .parseStatement(tableQuery)
-//              .asInstanceOf[CreateTableStatement.RawStatement]
-//            val createTableStatement = createTable
-//              .prepare()
-//              .statement
-//              .asInstanceOf[CreateTableStatement]
-            schemaChange(tableQuery, ksName)
-            Right(createTableQuery)
-          }
-        )
-      }
-    )
-
-  }
-
-  private def schemaChange(query: String, ksName: String) = {
     try {
-      state.setKeyspace(ksName)
-      val prepared = QueryProcessor.parseStatement(query, queryState)
-      val options = QueryOptions.forInternalCalls(Collections.emptyList())
-      prepared.statement.execute(queryState, options)
+      queries.map { query =>
+        val parsed: CFStatement =
+          QueryProcessor.parseStatement(query).asInstanceOf[CFStatement]
+        parsed match {
+          case keyspaceStatement: CreateKeyspaceStatement =>
+            val ksName = keyspaceStatement.keyspace()
+            val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local())
+            state.setKeyspace(ksName)
+            Schema.instance.load(meta) //set new keyspace metadata
+
+          case tableStatement: CreateTableStatement.RawStatement =>
+
+            tableStatement.prepare().statement.validate(state) //verify if the keyspace is already exist
+
+            val statement: CreateTableStatement =
+              parsed
+                .asInstanceOf[CreateTableStatement.RawStatement]
+                .prepare(Types.none)
+                .statement
+                .asInstanceOf[CreateTableStatement]
+
+            val meta =
+              KeyspaceMetadata.create(tableStatement.keyspace(),
+                KeyspaceParams.local(),
+                Tables.of(statement.getCFMetaData))
+            Schema.instance.load(meta) //set keyspaceMetadata with the columnfamily
+
+          //Keyspace.openWithoutSSTables(state.getKeyspace) /* create keyspace instance with columnFamily and load keyspace//TO BE FIXED// upgrade cassandra version to 3.11*/
+        }
+      }
+      Right("good")
     } catch {
-      case e: RequestValidationException => println(e.getMessage)
+      case e: RequestValidationException => Left(e.getMessage)
     }
   }
 }
