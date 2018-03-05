@@ -1,12 +1,12 @@
 package cassandra.schema
 
 import java.lang.management.ManagementFactory
-import java.util.Collections
 import javax.management.MBeanServer
 
-import org.apache.cassandra.config.{Config, Schema}
+import org.apache.cassandra.config.{Config, Schema => CassandraSchema}
+import org.apache.cassandra.cql3.QueryProcessor
 import org.apache.cassandra.cql3.statements.{CFStatement, CreateKeyspaceStatement, CreateTableStatement}
-import org.apache.cassandra.cql3.{QueryOptions, QueryProcessor}
+import org.apache.cassandra.db.Keyspace
 import org.apache.cassandra.exceptions.RequestValidationException
 import org.apache.cassandra.schema._
 import org.apache.cassandra.service.{ClientState, QueryState}
@@ -20,21 +20,20 @@ object SchemaValidation {
   val queryState = new QueryState(state)
 
   implicit class ValidateQuery(query: String) {
-    def validateSyntax: Either[String, String] = {
+    def validateSyntax: Either[String, String] =
       try {
         QueryProcessor.parseStatement(query)
         Right(query)
       } catch {
         case e: RequestValidationException => Left(e.getMessage)
       }
-    }
   }
 
   def checkSchema(query: String): Either[String, String] = {
-    query.validateSyntax //FIXME: validate statement
+    query.validateSyntax //FIXME: validate statement after upgrating cassandra version 3.11
   }
 
-  def createSchema(queries: Seq[String]): Either[String, String] = {
+  def createSchema(queries: Seq[String]): Either[String, Schema] = {
 
     //unregistered from cassandra instances to avoid javax.management.InstanceAlreadyExistsException
     val mbs: MBeanServer = ManagementFactory.getPlatformMBeanServer
@@ -44,10 +43,8 @@ object SchemaValidation {
         _.getObjectName.getCanonicalName.contains("org.apache.cassandra"))
       .foreach(i => mbs.unregisterMBean(i.getObjectName))
 
-    val options = QueryOptions.forInternalCalls(Collections.emptyList())
-
     try {
-      queries.map { query =>
+      val data = queries.foldLeft(Map.empty[String, Seq[Table]]) { (data, query) =>
         val parsed: CFStatement =
           QueryProcessor.parseStatement(query).asInstanceOf[CFStatement]
         parsed match {
@@ -55,7 +52,9 @@ object SchemaValidation {
             val ksName = keyspaceStatement.keyspace()
             val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local())
             state.setKeyspace(ksName)
-            Schema.instance.load(meta) //set new keyspace metadata
+            CassandraSchema.instance.load(meta) //set new keyspace metadata
+            Keyspace.openWithoutSSTables(ksName) //FIXME to be deleted after upgrading cassandra 3.11
+            data.updated(state.getKeyspace, Seq.empty[Table]) //add keyspace in our local schema
 
           case tableStatement: CreateTableStatement.RawStatement =>
 
@@ -68,16 +67,26 @@ object SchemaValidation {
                 .statement
                 .asInstanceOf[CreateTableStatement]
 
+            val ksName = tableStatement.keyspace()
             val meta =
-              KeyspaceMetadata.create(tableStatement.keyspace(),
+              KeyspaceMetadata.create(ksName,
                 KeyspaceParams.local(),
                 Tables.of(statement.getCFMetaData))
-            Schema.instance.load(meta) //set keyspaceMetadata with the columnfamily
+
+            CassandraSchema.instance.unload(statement.getCFMetaData) // avoid to reload the same CFMetadata
+            CassandraSchema.instance.load(meta) //set keyspaceMetadata with tables and views
+            CassandraSchema.instance.getKeyspaceInstance(state.getKeyspace).setMetadata(meta) //FIXME to be deleted after upgrading cassandra 3.11
+
+            val columns =
+              statement.getCFMetaData.allColumns().asScala.map(column => Column(column.name.toString,
+                column.`type`.asCQL3Type().toString))
+            val tables = data(state.getKeyspace) ++ Seq(Table(name = statement.columnFamily(), columns.toSeq))
+            data.updated(state.getKeyspace, tables) //set rows
 
           //Keyspace.openWithoutSSTables(state.getKeyspace) /* create keyspace instance with columnFamily and load keyspace//TO BE FIXED// upgrade cassandra version to 3.11*/
         }
       }
-      Right("good")
+      Right(Schema(data))
     } catch {
       case e: RequestValidationException => Left(e.getMessage)
     }
