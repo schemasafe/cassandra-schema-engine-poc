@@ -7,15 +7,17 @@ object Example extends App {
     "create table test.posts(id int primary key, name text)")
 
   val result = SchemaValidation.createSchema(queries)
-  val select = SchemaValidation.checkSchema(result.right.get, "select * from test.posts limit 1")
-  val update = SchemaValidation.checkSchema(result.right.get, "update test.posts set name = ? where id = 1")
-  val delete = SchemaValidation.checkSchema(result.right.get, "delete from test.posts where id = 1")
-  val insert = SchemaValidation.checkSchema(result.right.get, "INSERT INTO test.posts (id, name) VALUES (?, ?) IF NOT EXISTS;")
-
   println(s"* create schema: $result")
-  println(s"* check select statement: $select")
-  println(s"* check update statement: $update")
-  println(s"* check delete statement: $delete")
-  println(s"* check insert statement: $insert")
 
+  result.map {schema =>
+    val select = SchemaValidation.checkSchema(schema, "select * from test.posts limit 1")
+    val update = SchemaValidation.checkSchema(schema, "update test.posts set name = ? where id = 1")
+    val delete = SchemaValidation.checkSchema(schema, "delete from test.posts where id = 1")
+    val insert = SchemaValidation.checkSchema(schema, "INSERT INTO test.posts (id, name) VALUES (?, ?) IF NOT EXISTS;")
+
+    println(s"* check select statement: $select")
+    println(s"* check update statement: $update")
+    println(s"* check delete statement: $delete")
+    println(s"* check insert statement: $insert")
+  }
 }

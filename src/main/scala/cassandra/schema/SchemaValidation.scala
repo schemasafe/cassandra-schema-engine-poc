@@ -8,7 +8,7 @@ import org.apache.cassandra.cql3.QueryProcessor
 import org.apache.cassandra.cql3.statements._
 import org.apache.cassandra.exceptions.RequestValidationException
 import org.apache.cassandra.schema._
-import org.apache.cassandra.service.{ClientState, QueryState}
+import org.apache.cassandra.service.ClientState
 
 import scala.collection.JavaConverters._
 
@@ -16,7 +16,6 @@ object SchemaValidation {
   Config.setClientMode(true)
 
   val state = ClientState.forInternalCalls()
-  val queryState = new QueryState(state)
 
   def createSchema(schemaDefinitionStatements: Seq[String]): Either[String, Schema] = {
 
@@ -37,17 +36,12 @@ object SchemaValidation {
             parsed match {
               case keyspaceStatement: CreateKeyspaceStatement =>
                 val ksName = keyspaceStatement.keyspace()
-                val meta =
-                  KeyspaceMetadata.create(ksName, KeyspaceParams.local())
-                state.setKeyspace(ksName)
+                val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local())
                 CassandraSchema.instance.load(meta) //set new keyspace metadata
-                data.updated(state.getKeyspace, Seq.empty[Table]) //add keyspace in our local schema
+                data.updated(ksName, Seq.empty[Table]) //add keyspace in our local schema
 
               case tableStatement: CreateTableStatement.RawStatement =>
-                tableStatement
-                  .prepare()
-                  .statement
-                  .validate(state) //verify if the keyspace is already exist
+                tableStatement.prepare().statement.validate(state) //verify if the keyspace is already exist
 
                 val statement: CreateTableStatement =
                   parsed
@@ -57,8 +51,7 @@ object SchemaValidation {
                     .asInstanceOf[CreateTableStatement]
 
                 val ksName = tableStatement.keyspace()
-                val meta =
-                  KeyspaceMetadata.create(ksName, KeyspaceParams.local(), Tables.of(statement.getCFMetaData))
+                val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local(), Tables.of(statement.getCFMetaData))
 
                 CassandraSchema.instance.unload(statement.getCFMetaData) // avoid to reload the same CFMetadata
                 CassandraSchema.instance.load(meta) //set keyspaceMetadata with tables and views
@@ -105,7 +98,7 @@ object SchemaValidation {
             selectableColumns.intersect(schemaColumns).size < selectableColumns.size //undefined column name
 
           if (isFailed)
-            select.prepare().statement.validate(state) //in SELECT  if the schema is valid we will get an exception
+            select.prepare().statement.validate(state) //in SELECT if the schema is valid we will get an exception to be fixed in 3.11
 
           //NOW WE ARE SURE THAT THE QUERY IS VALID
           val output = {
@@ -120,7 +113,8 @@ object SchemaValidation {
           Right(Result(ksName, output, maybeLimit, input = Seq.empty))
 
         case parsedStatement =>
-          val modificationStatement = parsedStatement.prepare().statement.asInstanceOf[ModificationStatement]
+          val preparedStatemet = parsedStatement.prepare()
+          val modificationStatement = preparedStatemet.statement.asInstanceOf[ModificationStatement] //validate statement
 
           val ksName = modificationStatement.keyspace()
           val tableName = modificationStatement.columnFamily()
@@ -133,7 +127,7 @@ object SchemaValidation {
             }
           }.toMap
 
-          val bounds = parsedStatement.prepare().boundNames.asScala.map(_.name.toString)
+          val bounds = preparedStatemet.boundNames.asScala.map(_.name.toString)
           val input = output.map { case(name, columnType) =>
             val maybeValue = bounds.find(_ == name).fold[Option[String]](Some("TODO"))(_ => None) //todo get the updatedValues from modificationStatement
             maybeValue -> columnType
