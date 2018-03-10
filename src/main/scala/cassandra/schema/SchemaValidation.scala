@@ -41,7 +41,7 @@ object SchemaValidation {
                 data.updated(ksName, Seq.empty[Table]) //add keyspace in our local schema
 
               case tableStatement: CreateTableStatement.RawStatement =>
-                tableStatement.prepare().statement.validate(state) //verify if the keyspace is already exist
+                tableStatement.prepare(state).statement.validate(state) //verify if the keyspace is already exist
 
                 val statement: CreateTableStatement =
                   parsed
@@ -98,7 +98,7 @@ object SchemaValidation {
             selectableColumns.intersect(schemaColumns).size < selectableColumns.size //undefined column name
 
           if (isFailed)
-            select.prepare().statement.validate(state) //in SELECT if the schema is valid we will get an exception to be fixed in 3.11
+            select.prepare(state).statement.validate(state) //in SELECT if the schema is valid we will get an exception to be fixed in 3.11
 
           //NOW WE ARE SURE THAT THE QUERY IS VALID
           val output = {
@@ -113,7 +113,7 @@ object SchemaValidation {
           Right(Result(ksName, output, maybeLimit, input = Seq.empty))
 
         case parsedStatement =>
-          val preparedStatemet = parsedStatement.prepare()
+          val preparedStatemet = parsedStatement.prepare(state)
           val modificationStatement = preparedStatemet.statement.asInstanceOf[ModificationStatement] //validate statement
 
           val ksName = modificationStatement.keyspace()
