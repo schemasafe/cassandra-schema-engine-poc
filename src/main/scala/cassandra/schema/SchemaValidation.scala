@@ -2,20 +2,18 @@ package cassandra.schema
 
 import java.lang.management.ManagementFactory
 import javax.management.MBeanServer
+import scala.collection.JavaConverters._
 
-import org.apache.cassandra.config.{Config, Schema => CassandraSchema}
+import org.apache.cassandra.config.{CFMetaData, DatabaseDescriptor, Schema => CassandraSchema}
 import org.apache.cassandra.cql3.QueryProcessor
 import org.apache.cassandra.cql3.statements._
 import org.apache.cassandra.exceptions.RequestValidationException
 import org.apache.cassandra.schema._
 import org.apache.cassandra.service.ClientState
 
-import scala.collection.JavaConverters._
-
 object SchemaValidation {
-  Config.setClientMode(true)
-
-  val state = ClientState.forInternalCalls()
+  lazy val state: ClientState = ClientState.forInternalCalls()
+  DatabaseDescriptor.clientInitialization()
 
   def createSchema(schemaDefinitionStatements: Seq[String]): Either[String, Schema] = {
 
@@ -28,115 +26,73 @@ object SchemaValidation {
       .foreach(i => mbs.unregisterMBean(i.getObjectName))
 
     try {
-      val data =
-        schemaDefinitionStatements.foldLeft(Map.empty[String, Seq[Table]]) {
+      val data = schemaDefinitionStatements.foldLeft(Map.empty[String, Seq[Table]]) {
           (data, query) =>
-            val parsed: CFStatement =
-              QueryProcessor.parseStatement(query).asInstanceOf[CFStatement]
-            parsed match {
+            val creationStatement =
+              QueryProcessor.prepareInternal(query).statement
+
+            creationStatement match {
               case keyspaceStatement: CreateKeyspaceStatement =>
                 val ksName = keyspaceStatement.keyspace()
-                val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local())
-                CassandraSchema.instance.load(meta) //set new keyspace metadata
+                addKeyspace(ksName)
                 data.updated(ksName, Seq.empty[Table]) //add keyspace in our local schema
 
-              case tableStatement: CreateTableStatement.RawStatement =>
-                tableStatement.prepare(state).statement.validate(state) //verify if the keyspace is already exist
+              case statement: CreateTableStatement =>
+                val table = statement.getCFMetaData
+                addTable(table)
 
-                val statement: CreateTableStatement =
-                  parsed
-                    .asInstanceOf[CreateTableStatement.RawStatement]
-                    .prepare(Types.none)
-                    .statement
-                    .asInstanceOf[CreateTableStatement]
+                val ksName = statement.keyspace()
+                val columns = table.allColumns().asScala.map { column =>
+                  column.name.toString -> column.`type`.asCQL3Type().toString
+                }
 
-                val ksName = tableStatement.keyspace()
-                val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local(), Tables.of(statement.getCFMetaData))
-
-                CassandraSchema.instance.unload(statement.getCFMetaData) // avoid to reload the same CFMetadata
-                CassandraSchema.instance.load(meta) //set keyspaceMetadata with tables and views
-
-                val columns =
-                  statement.getCFMetaData.allColumns().asScala.map { column =>
-                    column.name.toString -> column.`type`.asCQL3Type().toString
-                  }
                 val tables = data(ksName) ++ Seq(Table(name = statement.columnFamily(), columns.toMap))
-                data.updated(ksName, tables) //set rows
+                data.updated(ksName, tables) //add table with columns in keyspace
             }
         }
       Right(Schema(data))
     } catch {
       case e: RequestValidationException => Left(e.getMessage)
+      case ex: Exception => Left(s"Internal error: ${ex.getMessage}")
     }
   }
 
   def checkSchema(schema: Schema, query: String): Either[String, Result] = {
     try {
-      val parse = QueryProcessor.parseStatement(query)
-
-      parse match {
-        case select: SelectStatement.RawStatement =>
-          val ksName = select.keyspace()
-          val tableName = select.columnFamily()
-          val schemaColumns = schema.data
-            .get(ksName)
-            .flatMap(tables => tables.find(_.name == tableName))
-            .fold(Seq.empty[String]) { table =>
-              table.columns.keySet.toSeq
-            }
-
-          val selectableColumns = {
-            val columns =
-              select.selectClause.asScala.map(_.selectable.toString)
-            if (columns.isEmpty)
-              schemaColumns //in case of SELECT *
-            else columns
-          }
-
-          val isFailed = schema.data.get(ksName).isEmpty /*Keyspace does not exist*/ ||
-            schemaColumns.isEmpty /*table does not exist*/ ||
-            selectableColumns.intersect(schemaColumns).size < selectableColumns.size //undefined column name
-
-          if (isFailed)
-            select.prepare(state).statement.validate(state) //in SELECT if the schema is valid we will get an exception to be fixed in 3.11
-
-          //NOW WE ARE SURE THAT THE QUERY IS VALID
-          val output = {
-            selectableColumns.map { name =>
-              val columnType = schema.data(ksName).find(_.name == tableName).map(_.columns(name)).orNull
-              name -> columnType
-            }
-          }.toMap
-
-          val maybeLimit = if (select.limit == null) None else Some(select.limit.getText.toInt)
-
-          Right(Result(ksName, output, maybeLimit, input = Seq.empty))
-
-        case parsedStatement =>
-          val preparedStatemet = parsedStatement.prepare(state)
-          val modificationStatement = preparedStatemet.statement.asInstanceOf[ModificationStatement] //validate statement
-
-          val ksName = modificationStatement.keyspace()
-          val tableName = modificationStatement.columnFamily()
-
-          val output = {
-            val columns = modificationStatement.allOperations().asScala.map(_.column.toString)
-            columns.map { name =>
-              val columnType = schema.data(ksName).find(_.name == tableName).map(_.columns(name)).orNull
-              name -> columnType
-            }
-          }.toMap
-
-          val bounds = preparedStatemet.boundNames.asScala.map(_.name.toString)
-          val input = output.map { case(name, columnType) =>
-            val maybeValue = bounds.find(_ == name).fold[Option[String]](Some("TODO"))(_ => None) //todo get the updatedValues from modificationStatement
-            maybeValue -> columnType
+      val prepared = QueryProcessor.prepareInternal(query)
+      val statement = prepared.statement
+      statement match {
+        case _: SelectStatement => ??? //internal error
+        case st: ModificationStatement =>
+          val ksName = st.keyspace()
+          val updatedColumns = st.updatedColumns().asScala
+          val output = updatedColumns.map(col => col.name.toString -> col.`type`.asCQL3Type().toString).toMap
+          val bounds = prepared.boundNames.asScala.map(_.name.toString).toList
+          val input = output.map {
+            case (name, columnType) =>
+              val maybeValue = bounds.find(_ == name).fold[Option[String]](Some("TODO"))(_ => None)
+              maybeValue -> columnType
           }.toSeq
 
           Right(Result(ksName, output, None, input = input))
       }
     } catch {
       case e: RequestValidationException => Left(e.getMessage)
+      case ex: Exception => Left(s"Internal error: ${ex.getMessage}")
+
     }
   }
+
+  private def addKeyspace(ksName: String): Unit = {
+    val meta = KeyspaceMetadata.create(ksName, KeyspaceParams.local())
+    CassandraSchema.instance.addKeyspace(meta)
+  }
+
+  private def addTable(cfMeta: CFMetaData): Unit = {
+    //CassandraSchema.instance.addTable(cfMeta) //TODO store table in CassandraSchema instance but there is an exception https://github.com/apache/cassandra/pull/223 :( and then we can implement select
+    val ks = CassandraSchema.instance.getKSMetaData(cfMeta.ksName)
+    val s = ks.withSwapped(ks.tables.`with`(cfMeta))
+    CassandraSchema.instance.setKeyspaceMetadata(s)
+  }
+
 }
